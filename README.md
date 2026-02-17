@@ -78,7 +78,7 @@ Since Mini-SGLang requires Linux-specific dependencies, Windows users should use
 <details>
 <summary><b>🐳 Running with Docker</b></summary>
 
-**Prerequisites**: 
+**Prerequisites**:
 - [Docker](https://docs.docker.com/get-docker/)
 - [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 
