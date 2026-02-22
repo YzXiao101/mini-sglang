@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from minisgl.core import Batch, Req
+from minisgl.env import ENV
 from minisgl.utils import init_logger
 
 from .utils import PendingReq
@@ -133,8 +134,10 @@ class PrefillManager:
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
         )
+        enable_hol_bypass = ENV.ENABLE_PREFILL_HOL_BYPASS.value
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
+        skipped_list: List[PendingReq] = []
         for pending_req in self.pending_list:
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
@@ -143,10 +146,20 @@ class PrefillManager:
                     chunked_list.append(pending_req)
                 reqs.append(req)
             else:
-                break  # We cannot add more requests
+                if not enable_hol_bypass:
+                    break  # keep original FCFS behavior by default
+                if pending_req.chunked_req is not None:
+                    chunked_list.append(pending_req)
+                else:
+                    skipped_list.append(pending_req)
+
         if len(reqs) == 0:
             return None
-        self.pending_list = chunked_list + self.pending_list[len(reqs) :]
+
+        if enable_hol_bypass:
+            self.pending_list = chunked_list + skipped_list
+        else:
+            self.pending_list = chunked_list + self.pending_list[len(reqs) :]
         return Batch(reqs=reqs, phase="prefill")
 
     def abort_req(self, uid: int) -> Req | None:
