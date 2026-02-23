@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Tuple
 
 import torch
 from minisgl.core import Batch, Req
@@ -35,9 +35,13 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    last_fail_reason: str = ""
+    last_fail_deficit: int = 0
+    last_fail_estimated_len: int = 0
 
     def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
         if self.table_manager.available_size == 0:
+            self.last_fail_reason = "table"
             return None
 
         handle, match_indices = self.cache_manager.match_req(req)
@@ -46,11 +50,21 @@ class PrefillAdder:
         extend_len = req.input_len - cached_len
         estimated_len = extend_len + req.output_len
 
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
+        needed = estimated_len + self.reserved_size
+        available = self.cache_manager.available_size
+        if needed > available:
+            self.last_fail_reason = "estimate"
+            self.last_fail_deficit = needed - available
+            self.last_fail_estimated_len = estimated_len
             return None
         self.cache_manager.lock(handle)
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
-            return self.cache_manager.unlock(handle)
+        available = self.cache_manager.available_size
+        if needed > available:
+            self.cache_manager.unlock(handle)
+            self.last_fail_reason = "estimate"
+            self.last_fail_deficit = needed - available
+            self.last_fail_estimated_len = estimated_len
+            return None
 
         table_idx = self.table_manager.allocate()
         if cached_len > 0:  # NOTE: set the cached part
@@ -89,7 +103,11 @@ class PrefillAdder:
         )
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
+        self.last_fail_reason = ""
+        self.last_fail_deficit = 0
+        self.last_fail_estimated_len = 0
         if self.token_budget <= 0:
+            self.last_fail_reason = "budget"
             return None
 
         if chunked_req := pending_req.chunked_req:
@@ -118,13 +136,28 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    prompt_len_map: Dict[int, int] = field(default_factory=dict)
+    max_tokens_map: Dict[int, int] = field(default_factory=dict)
+    prefill_rounds: int = 0
+    estimate_reject_count: int = 0
+    estimate_reject_deficit_tokens: int = 0
+    estimate_reject_estimated_tokens: int = 0
+    estimate_hol_blocked_rounds: int = 0
+    estimate_hol_blocked_reqs: int = 0
+    decode_reserved_tokens: int = 0
+    decode_realized_tokens: int = 0
+    finished_reqs: int = 0
+    aborted_reqs: int = 0
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
+        self.prompt_len_map[req.uid] = len(req.input_ids)
+        self.max_tokens_map[req.uid] = req.sampling_params.max_tokens
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:
             return None
+        self.prefill_rounds += 1
 
         # estimated offset due to in-flight decode
         adder = PrefillAdder(
@@ -135,7 +168,7 @@ class PrefillManager:
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
-        for pending_req in self.pending_list:
+        for i, pending_req in enumerate(self.pending_list):
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
@@ -143,6 +176,14 @@ class PrefillManager:
                     chunked_list.append(pending_req)
                 reqs.append(req)
             else:
+                if adder.last_fail_reason == "estimate":
+                    self.estimate_reject_count += 1
+                    self.estimate_reject_deficit_tokens += adder.last_fail_deficit
+                    self.estimate_reject_estimated_tokens += adder.last_fail_estimated_len
+                    blocked_reqs = len(self.pending_list) - i - 1
+                    if blocked_reqs > 0:
+                        self.estimate_hol_blocked_rounds += 1
+                        self.estimate_hol_blocked_reqs += blocked_reqs
                 break  # We cannot add more requests
         if len(reqs) == 0:
             return None
@@ -153,8 +194,75 @@ class PrefillManager:
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)
+                self.on_req_aborted(uid)
                 return req.chunked_req
         return None
+
+    def on_req_finished(self, req: Req) -> None:
+        prompt_len = self.prompt_len_map.pop(req.uid, len(req.input_ids))
+        max_tokens = self.max_tokens_map.pop(req.uid, req.output_len)
+        realized = len(req.input_ids) - prompt_len
+        realized = max(0, min(realized, max_tokens))
+        self.finished_reqs += 1
+        self.decode_reserved_tokens += max_tokens
+        self.decode_realized_tokens += realized
+
+    def on_req_aborted(self, uid: int) -> None:
+        had_prompt = uid in self.prompt_len_map
+        had_max_tokens = uid in self.max_tokens_map
+        self.prompt_len_map.pop(uid, None)
+        self.max_tokens_map.pop(uid, None)
+        if had_prompt or had_max_tokens:
+            self.aborted_reqs += 1
+
+    def reset_estimation_metrics(self) -> None:
+        self.prompt_len_map.clear()
+        self.max_tokens_map.clear()
+        self.prefill_rounds = 0
+        self.estimate_reject_count = 0
+        self.estimate_reject_deficit_tokens = 0
+        self.estimate_reject_estimated_tokens = 0
+        self.estimate_hol_blocked_rounds = 0
+        self.estimate_hol_blocked_reqs = 0
+        self.decode_reserved_tokens = 0
+        self.decode_realized_tokens = 0
+        self.finished_reqs = 0
+        self.aborted_reqs = 0
+
+    def estimation_metrics(self) -> Dict[str, float]:
+        reject_round_ratio = (
+            self.estimate_reject_count / self.prefill_rounds if self.prefill_rounds > 0 else 0.0
+        )
+        avg_reject_deficit = (
+            self.estimate_reject_deficit_tokens / self.estimate_reject_count
+            if self.estimate_reject_count > 0
+            else 0.0
+        )
+        avg_reject_estimated_tokens = (
+            self.estimate_reject_estimated_tokens / self.estimate_reject_count
+            if self.estimate_reject_count > 0
+            else 0.0
+        )
+        decode_unused = max(0, self.decode_reserved_tokens - self.decode_realized_tokens)
+        decode_unused_ratio = (
+            decode_unused / self.decode_reserved_tokens if self.decode_reserved_tokens > 0 else 0.0
+        )
+        return {
+            "prefill_rounds": float(self.prefill_rounds),
+            "estimate_reject_count": float(self.estimate_reject_count),
+            "estimate_reject_round_ratio": reject_round_ratio,
+            "estimate_reject_avg_deficit_tokens": avg_reject_deficit,
+            "estimate_reject_avg_estimated_tokens": avg_reject_estimated_tokens,
+            "estimate_hol_blocked_rounds": float(self.estimate_hol_blocked_rounds),
+            "estimate_hol_blocked_reqs": float(self.estimate_hol_blocked_reqs),
+            "decode_reserved_tokens": float(self.decode_reserved_tokens),
+            "decode_realized_tokens": float(self.decode_realized_tokens),
+            "decode_unused_tokens": float(decode_unused),
+            "decode_unused_ratio": decode_unused_ratio,
+            "finished_reqs": float(self.finished_reqs),
+            "aborted_reqs": float(self.aborted_reqs),
+            "tracked_reqs": float(len(self.prompt_len_map)),
+        }
 
     @property
     def runnable(self) -> bool:

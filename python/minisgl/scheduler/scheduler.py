@@ -98,6 +98,7 @@ class Scheduler(SchedulerIOMixin):
             # NOTE: overlap scheduling may make the request freed twice, skip second free
             if finished and req not in self.finished_reqs:
                 self.decode_manager.remove_req(req)
+                self.prefill_manager.on_req_finished(req)
                 self._free_req_resources(req)
                 new_finished_reqs.add(req)
         self.finished_reqs = new_finished_reqs
@@ -127,7 +128,10 @@ class Scheduler(SchedulerIOMixin):
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
-            req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+            if req_to_free is None:
+                req_to_free = self.decode_manager.abort_req(msg.uid)
+                if req_to_free is not None:
+                    self.prefill_manager.on_req_aborted(msg.uid)
             if req_to_free is not None:
                 self._free_req_resources(req_to_free)
         else:
@@ -239,9 +243,28 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
+        self.log_estimation_metrics()
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
+
+    def log_estimation_metrics(self) -> None:
+        m = self.prefill_manager.estimation_metrics()
+        logger.info_rank0(
+            "EstimateMetrics "
+            f"prefill_rounds={m['prefill_rounds']:.0f} "
+            f"estimate_reject_count={m['estimate_reject_count']:.0f} "
+            f"estimate_reject_round_ratio={m['estimate_reject_round_ratio']:.4f} "
+            f"estimate_reject_avg_deficit_tokens={m['estimate_reject_avg_deficit_tokens']:.2f} "
+            f"estimate_hol_blocked_reqs={m['estimate_hol_blocked_reqs']:.0f} "
+            f"decode_reserved_tokens={m['decode_reserved_tokens']:.0f} "
+            f"decode_realized_tokens={m['decode_realized_tokens']:.0f} "
+            f"decode_unused_tokens={m['decode_unused_tokens']:.0f} "
+            f"decode_unused_ratio={m['decode_unused_ratio']:.4f} "
+            f"finished_reqs={m['finished_reqs']:.0f} "
+            f"aborted_reqs={m['aborted_reqs']:.0f} "
+            f"tracked_reqs={m['tracked_reqs']:.0f}"
+        )
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
