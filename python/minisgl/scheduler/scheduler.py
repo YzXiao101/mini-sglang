@@ -70,6 +70,22 @@ class Scheduler(SchedulerIOMixin):
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
+        self.init_new_token_ratio = min(
+            ENV.INIT_NEW_TOKEN_RATIO.value * ENV.SCHEDULE_CONSERVATIVENESS.value, 1.0
+        )
+        self.min_new_token_ratio = min(
+            self.init_new_token_ratio * ENV.MIN_NEW_TOKEN_RATIO_FACTOR.value, 1.0
+        )
+        self.new_token_ratio_decay = (
+            self.init_new_token_ratio - self.min_new_token_ratio
+        ) / ENV.NEW_TOKEN_RATIO_DECAY_STEPS.value
+        self.new_token_ratio = self.init_new_token_ratio
+        self.clip_max_new_tokens_estimation = ENV.CLIP_MAX_NEW_TOKENS_ESTIMATION.value
+        self.retract_decode_steps = ENV.RETRACT_DECODE_STEPS.value
+        self.decode_manager.new_token_ratio = self.new_token_ratio
+        self.decode_manager.min_new_token_ratio = self.min_new_token_ratio
+        self.decode_manager.new_token_ratio_decay = self.new_token_ratio_decay
+        self.decode_manager.retract_decode_steps = self.retract_decode_steps
         # self.config = config
 
         # Initialize the I/O mixin
@@ -77,6 +93,8 @@ class Scheduler(SchedulerIOMixin):
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
+        self.new_token_ratio = self.init_new_token_ratio
+        self.decode_manager.new_token_ratio = self.new_token_ratio
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
 
@@ -218,10 +236,18 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
+        batch = self.prefill_manager.schedule_next_batch(
+            self.prefill_budget,
+            self.decode_manager.new_token_ratio,
+            self.clip_max_new_tokens_estimation,
         )
+        if batch is None:
+            batch = self.decode_manager.schedule_next_batch(
+                self.cache_manager,
+                self.table_manager,
+                self.prefill_manager,
+            )
+            self.new_token_ratio = self.decode_manager.new_token_ratio
         return self._prepare_batch(batch) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
