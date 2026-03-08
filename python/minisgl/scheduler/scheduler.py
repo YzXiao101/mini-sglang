@@ -154,6 +154,7 @@ class Scheduler(SchedulerIOMixin):
         self.engine.shutdown()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
+        # TODO(yzxiao): skip retracted requests
         if last_data is None:
             return
 
