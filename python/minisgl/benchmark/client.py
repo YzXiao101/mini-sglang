@@ -208,12 +208,13 @@ async def benchmark_one(
     pbar: Console | bool = True,
     extra_body: Dict[str, Any] | None = None,
     input_length: int | None = None,  # a hack to force input length
+    ignore_eos: bool = True,
 ) -> RawResult:
     if isinstance(pbar, bool):
         pbar = make_console(1, output_length, use_pbar=pbar)
     with pbar.inflight(1):
         kwargs = {
-            "ignore_eos": True,
+            "ignore_eos": ignore_eos,
             "top_k": 1,
         }
         # this is an internal kwargs that might work for our system
@@ -257,6 +258,7 @@ async def benchmark_one_batch(
     extra_body: Dict[str, Any] | None = None,
     input_lengths: List[int | None] | None = None,
     pbar: Console | bool = True,
+    ignore_eos: bool = True,
 ) -> List[RawResult]:
     if isinstance(output_lengths, int):
         output_lengths = [output_lengths] * len(prompts)
@@ -275,6 +277,7 @@ async def benchmark_one_batch(
             pbar=pbar,
             extra_body=extra_body,
             input_length=input_length,
+            ignore_eos=ignore_eos,
         )
         for prompt, output_length, input_length in zip(
             prompts, output_lengths, input_lengths, strict=True
@@ -290,6 +293,7 @@ async def benchmark_trace(
     model: str,
     *,
     pbar: Console | bool = True,
+    ignore_eos: bool = True,
 ) -> List[RawResult]:
     if isinstance(pbar, bool):
         sum_output_len = sum(msg.output_length for msg in msgs)
@@ -301,7 +305,13 @@ async def benchmark_trace(
         target = start + msg.timestamp - offset
         await asyncio.sleep(max(0, target - time.perf_counter()))
         return await benchmark_one(
-            client, msg.message, msg.output_length, model, pbar=pbar, input_length=msg.input_length
+            client,
+            msg.message,
+            msg.output_length,
+            model,
+            pbar=pbar,
+            input_length=msg.input_length,
+            ignore_eos=ignore_eos,
         )
 
     tasks = [benchmark_timed(msg) for msg in msgs]
