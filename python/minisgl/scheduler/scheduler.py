@@ -154,7 +154,6 @@ class Scheduler(SchedulerIOMixin):
         self.engine.shutdown()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
-        # TODO(yzxiao): skip retracted requests
         if last_data is None:
             return
 
@@ -164,6 +163,8 @@ class Scheduler(SchedulerIOMixin):
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
+                if req.is_retracted:
+                    continue
                 if isinstance(req, ChunkedReq):
                     continue
                 next_token = next_tokens_cpu[i]

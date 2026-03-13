@@ -66,6 +66,7 @@ class DecodeManager:
                 )
                 self.running_reqs.remove(req)
                 self.did_retract = True
+                req.is_retracted = True
                 cache_manager.cache_req(req, finished=True)
                 table_manager.free(req.table_idx)
                 prefill_manager.requeue_req(req, insert_idx)
