@@ -34,32 +34,15 @@ class ChunkedReq(Req):
 @dataclass
 class PrefillAdder:
     token_budget: int
-    reserved_size: int
     new_token_ratio: float
     clip_max_new_tokens_estimation: int
     cache_manager: CacheManager
     table_manager: TableManager
+    running_reqs: List[Req]
+    reserved_size: int = field(init=False)
 
-    @classmethod
-    def create(
-        cls,
-        token_budget: int,
-        new_token_ratio: float,
-        clip_max_new_tokens_estimation: int,
-        cache_manager: CacheManager,
-        table_manager: TableManager,
-        running_reqs: List[Req],
-    ) -> PrefillAdder:
-        adder = cls(
-            token_budget=token_budget,
-            reserved_size=0,
-            new_token_ratio=new_token_ratio,
-            clip_max_new_tokens_estimation=clip_max_new_tokens_estimation,
-            cache_manager=cache_manager,
-            table_manager=table_manager,
-        )
-        adder.reserved_size = sum(adder._get_running_reserve(req) for req in running_reqs)
-        return adder
+    def __post_init__(self) -> None:
+        self.reserved_size = sum(self._get_running_reserve(req) for req in self.running_reqs)
 
     def _get_running_reserve(self, req: Req) -> int:
         if req.sampling_params.ignore_eos:
@@ -194,7 +177,7 @@ class PrefillManager:
         if len(self.pending_list) == 0:
             return None
 
-        adder = PrefillAdder.create(
+        adder = PrefillAdder(
             token_budget=prefill_budget,
             new_token_ratio=new_token_ratio,
             clip_max_new_tokens_estimation=clip_max_new_tokens_estimation,
