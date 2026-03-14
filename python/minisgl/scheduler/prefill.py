@@ -3,10 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, List, Tuple
 
-import math
 import torch
 from minisgl.core import Batch, Req
-from minisgl.env import ENV
 from minisgl.utils import alloc_delta, init_logger
 
 from .utils import PendingReq
@@ -34,26 +32,12 @@ class ChunkedReq(Req):
 @dataclass
 class PrefillAdder:
     token_budget: int
-    new_token_ratio: float
+    reserved_size: int
     clip_max_new_tokens_estimation: int
     cache_manager: CacheManager
     table_manager: TableManager
-    running_reqs: List[Req]
-    reserved_size: int = field(init=False)
 
-    def __post_init__(self) -> None:
-        self.reserved_size = sum(self._get_running_reserve(req) for req in self.running_reqs)
-
-    def _get_running_reserve(self, req: Req) -> int:
-        if req.sampling_params.ignore_eos:
-            tail_est = req.remain_len
-        else:
-            tail_est = math.ceil(
-                min(req.remain_len, self.clip_max_new_tokens_estimation) * self.new_token_ratio
-            )
-        return alloc_delta(req.device_len, tail_est, self.cache_manager.page_size)
-
-    def _get_new_reserve(self, req: PendingReq, cached_len: int, chunk_size: int) -> int:
+    def _get_required_size(self, req: PendingReq, cached_len: int, chunk_size: int) -> int:
         # =======================================================================================
         # [0, cached_len)                                   prefix len already in cache
         # [cached_len, cached_len + chunk_size)             input len in this round
@@ -72,8 +56,8 @@ class PrefillAdder:
     def _can_add_one(self, req: PendingReq, cached_len: int) -> bool:
         extend_len = req.input_len - cached_len
         chunk_size = min(self.token_budget, extend_len)
-        estimated_len = self._get_new_reserve(req, cached_len, chunk_size)
-        return estimated_len + self.reserved_size <= self.cache_manager.available_size
+        required_size = self._get_required_size(req, cached_len, chunk_size)
+        return required_size + self.reserved_size <= self.cache_manager.available_size
 
     def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
         if self.table_manager.available_size == 0:
@@ -109,7 +93,7 @@ class PrefillAdder:
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
-        self.reserved_size += self._get_new_reserve(pending_req, cached_len, chunk_size)
+        self.reserved_size += self._get_required_size(pending_req, cached_len, chunk_size)
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
@@ -171,19 +155,16 @@ class PrefillManager:
     def schedule_next_batch(
         self,
         prefill_budget: int,
-        new_token_ratio: float,
-        clip_max_new_tokens_estimation: int,
     ) -> Batch | None:
         if len(self.pending_list) == 0:
             return None
 
         adder = PrefillAdder(
             token_budget=prefill_budget,
-            new_token_ratio=new_token_ratio,
-            clip_max_new_tokens_estimation=clip_max_new_tokens_estimation,
+            reserved_size=self.decode_manager.estimated_inflight_tokens(),
+            clip_max_new_tokens_estimation=self.decode_manager.clip_max_new_tokens_estimation,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
-            running_reqs=list(self.decode_manager.running_reqs),
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
