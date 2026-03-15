@@ -194,8 +194,12 @@ class PrefillManager:
             idx,
             PendingReq(
                 uid=req.uid,
-                input_ids=req.input_ids,  # NOTE: contains the prompt and the generated token
-                sampling_params=replace(req.sampling_params, max_tokens=req.remain_len),
+                # NOTE: overlap may have one delayed token not appended on host yet.
+                input_ids=req.input_ids,
+                sampling_params=replace(
+                    req.sampling_params,
+                    max_tokens=req.max_device_len - len(req.input_ids),
+                ),
                 prompt_len=req.prompt_len,
                 chunked_req=None,
             ),
