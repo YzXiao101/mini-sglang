@@ -33,43 +33,41 @@ class ChunkedReq(Req):
 class PrefillAdder:
     token_budget: int
     reserved_size: int
-    clip_max_new_tokens_estimation: int
+    clip_max_new_tokens: int
     cache_manager: CacheManager
     table_manager: TableManager
 
     def _get_required_size(self, req: PendingReq, cached_len: int, chunk_size: int) -> int:
-        # =======================================================================================
-        # [0, cached_len)                                   prefix len already in cache
-        # [cached_len, cached_len + chunk_size)             input len in this round
-        # [cached_len + chunk_size, req.prompt_len)         prompt len left for later chunks
-        # [req.prompt_len, req.prompt_len + req.output_len) decode budget len
-        # =======================================================================================
-        added_len = chunk_size
         if cached_len + chunk_size < req.input_len:
-            return alloc_delta(cached_len, added_len, self.cache_manager.page_size)
-        if req.sampling_params.ignore_eos:
-            added_len += req.output_len
+            added_len = chunk_size
+        elif req.sampling_params.ignore_eos:
+            added_len = chunk_size + req.output_len
         else:
-            added_len += min(req.output_len, self.clip_max_new_tokens_estimation)
+            added_len = chunk_size + min(req.output_len, self.clip_max_new_tokens)
         return alloc_delta(cached_len, added_len, self.cache_manager.page_size)
 
-    def _can_add_one(self, req: PendingReq, cached_len: int) -> bool:
-        extend_len = req.input_len - cached_len
-        chunk_size = min(self.token_budget, extend_len)
+    def _can_add_one(self, req: PendingReq, cached_len: int) -> int | None:
+        chunk_size = min(self.token_budget, req.input_len - cached_len)
         required_size = self._get_required_size(req, cached_len, chunk_size)
-        return required_size + self.reserved_size <= self.cache_manager.available_size
+        return (
+            None
+            if required_size + self.reserved_size > self.cache_manager.available_size
+            else required_size
+        )
 
-    def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
+    def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int, int] | None:
         if self.table_manager.available_size == 0:
             return None
 
         # TODO: consider host cache match case
         handle = self.cache_manager.match_req(req).cuda_handle
         cached_len = handle.cached_len
-        if not self._can_add_one(req, cached_len):
+        required_size = self._can_add_one(req, cached_len)
+        if required_size is None:
             return None
         self.cache_manager.lock(handle)
-        if not self._can_add_one(req, cached_len):
+        required_size = self._can_add_one(req, cached_len)
+        if required_size is None:
             return self.cache_manager.unlock(handle)
 
         table_idx = self.table_manager.allocate()
@@ -79,7 +77,7 @@ class PrefillAdder:
             device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
             page_entry.copy_(handle.get_matched_indices())
 
-        return handle, table_idx
+        return handle, table_idx, required_size
 
     def _add_one_req(
         self,
@@ -87,13 +85,14 @@ class PrefillAdder:
         cache_handle: BaseCacheHandle,
         table_idx: int,
         cached_len: int,
+        required_size: int,
     ) -> Req:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
-        self.reserved_size += self._get_required_size(pending_req, cached_len, chunk_size)
+        self.reserved_size += required_size
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
@@ -114,22 +113,25 @@ class PrefillAdder:
             return None
 
         if chunked_req := pending_req.chunked_req:
-            if not self._can_add_one(pending_req, chunked_req.cached_len):
+            required_size = self._can_add_one(pending_req, chunked_req.cached_len)
+            if required_size is None:
                 return None
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,
                 table_idx=chunked_req.table_idx,
                 cached_len=chunked_req.cached_len,
+                required_size=required_size,
             )
 
         if resource := self._try_allocate_one(pending_req):
-            cache_handle, table_idx = resource
+            cache_handle, table_idx, required_size = resource
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
                 table_idx=table_idx,
                 cached_len=cache_handle.cached_len,
+                required_size=required_size,
             )
 
         return None
@@ -161,8 +163,8 @@ class PrefillManager:
 
         adder = PrefillAdder(
             token_budget=prefill_budget,
-            reserved_size=self.decode_manager.estimated_inflight_tokens(),
-            clip_max_new_tokens_estimation=self.decode_manager.clip_max_new_tokens_estimation,
+            reserved_size=self.decode_manager.estimated_inflight_tokens,
+            clip_max_new_tokens=self.decode_manager.clip_max_new_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
         )
@@ -189,9 +191,14 @@ class PrefillManager:
                 return req.chunked_req
         return None
 
-    def requeue_req(self, req: Req, idx: int) -> None:
-        self.pending_list.insert(
-            idx,
+    def requeue_reqs(self, reqs: List[Req]) -> None:
+        if not reqs:
+            return
+        idx = next(
+            (i for i, pending in enumerate(self.pending_list) if pending.chunked_req is None),
+            len(self.pending_list),
+        )
+        self.pending_list[idx:idx] = [
             PendingReq(
                 uid=req.uid,
                 # NOTE: overlap may have one delayed token not appended on host yet.
@@ -201,9 +208,9 @@ class PrefillManager:
                     max_tokens=req.max_device_len - len(req.input_ids),
                 ),
                 prompt_len=req.prompt_len,
-                chunked_req=None,
-            ),
-        )
+            )
+            for req in reqs
+        ]
 
     @property
     def runnable(self) -> bool:

@@ -7,14 +7,12 @@ import random
 from pathlib import Path
 
 from minisgl.benchmark.client import (
-    BenchmarkTrace,
     benchmark_trace,
     get_model_name,
     process_benchmark_results,
     read_qwen_trace,
     scale_traces,
 )
-from minisgl.benchmark.wildchat import collect_filtered_wildchat_prompts
 from minisgl.utils import init_logger
 from openai import AsyncOpenAI as OpenAI
 from transformers import AutoTokenizer
@@ -39,9 +37,18 @@ def download_qwen_trace(url: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark MiniSGL with Qwen trace replay.")
-    parser.add_argument("--real-prompts", action="store_true")
-    parser.add_argument("--disable-ignore-eos", action="store_true")
-    parser.add_argument("--max-new-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--prompt-mode",
+        choices=["dummy", "random", "real"],
+        default="dummy",
+        help="Prompt source mode.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=4096,
+        help="Only takes effect when --prompt-mode=real.",
+    )
     return parser.parse_args()
 
 
@@ -54,20 +61,13 @@ async def main():
     async with OpenAI(base_url=f"http://127.0.0.1:{PORT}/v1", api_key="") as client:
         MODEL = await get_model_name(client)
         tokenizer = AutoTokenizer.from_pretrained(MODEL)
-        TRACES = read_qwen_trace(download_qwen_trace(URL), tokenizer, n=N, dummy=True)
-        if args.real_prompts:
-            prompts = collect_filtered_wildchat_prompts(N)
-            if len(prompts) == 0:
-                raise ValueError("No WildChat prompts available.")
-
-            TRACES = [
-                BenchmarkTrace(
-                    timestamp=trace.timestamp,
-                    message=prompts[i % len(prompts)],
-                    output_length=args.max_new_tokens,
-                )
-                for i, trace in enumerate(TRACES)
-            ]
+        TRACES = read_qwen_trace(
+            download_qwen_trace(URL),
+            tokenizer,
+            n=N,
+            prompt_mode=args.prompt_mode,
+            max_new_tokens=args.max_new_tokens,
+        )
 
         logger.info(f"Start benchmarking with {len(TRACES)} requests using model {MODEL}...")
         for scale in SCALES:
@@ -76,7 +76,7 @@ async def main():
                 client,
                 traces,
                 MODEL,
-                ignore_eos=not args.disable_ignore_eos,
+                ignore_eos=args.prompt_mode != "real",
             )
             process_benchmark_results(results)
         logger.info("Benchmarking completed.")

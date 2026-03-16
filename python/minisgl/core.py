@@ -42,7 +42,7 @@ class Req:
         self.device_len = len(self.input_ids)
         self.max_device_len = (
             max(self.device_len, self.prompt_len) + self.output_len
-        )  # NOTE: input_len(device_len) < prompt_len for chunked req
+        )
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
 
     @property

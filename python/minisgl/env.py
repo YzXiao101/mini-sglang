@@ -73,7 +73,7 @@ class EnvClassSingleton:
     INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
     MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
     NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
-    CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
+    CLIP_MAX_NEW_TOKENS = EnvInt(4096)
     RETRACT_DECODE_STEPS = EnvInt(20)
 
     def __new__(cls):
