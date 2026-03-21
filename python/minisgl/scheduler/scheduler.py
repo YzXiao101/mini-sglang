@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -19,6 +20,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
+from .metric_sink import SchedulerMetricSink
 from .prefill import ChunkedReq, PrefillManager
 from .table import TableManager
 
@@ -55,6 +57,10 @@ class Scheduler(SchedulerIOMixin):
         torch.cuda.set_stream(self.stream)
 
         # initialize other managers
+        self.metric_sink = SchedulerMetricSink(
+            os.getenv("MINISGL_ESTIMATE_METRICS_PATH"),
+            enabled=config.tp_info.is_primary(),
+        )
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
@@ -63,9 +69,13 @@ class Scheduler(SchedulerIOMixin):
             config.page_size,
             self.cache_manager,
             self.table_manager,
+            self.metric_sink,
         )
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            self.metric_sink,
         )
 
         # some alias for easy access
@@ -139,6 +149,7 @@ class Scheduler(SchedulerIOMixin):
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
+        self.metric_sink.close()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:

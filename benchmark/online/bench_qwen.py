@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import random
+import time
 from pathlib import Path
 
 from minisgl.benchmark.client import (
@@ -20,6 +22,7 @@ from transformers import AutoTokenizer
 logger = init_logger(__name__)
 
 URL = "https://media.githubusercontent.com/media/alibaba-edu/qwen-bailian-usagetraces-anon/refs/heads/main/qwen_traceA_blksz_16.jsonl"
+ESTIMATE_METRICS_PATH_ENV = "MINISGL_ESTIMATE_METRICS_PATH"
 
 
 def download_qwen_trace(url: str) -> str:
@@ -52,8 +55,26 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_phase_path() -> str | None:
+    if not (path := os.getenv(ESTIMATE_METRICS_PATH_ENV)):
+        return None
+    file_path = Path(path).expanduser()
+    return str(file_path.with_name(f"{file_path.stem}.phase.jsonl"))
+
+
+def _append_phase_manifest(path: str | None, event: str, **fields) -> None:
+    if not path:
+        return
+    file_path = Path(path).expanduser()
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    record = {"ts_ns": time.time_ns(), "event": event, **fields}
+    with file_path.open("a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
 async def main():
     args = parse_args()
+    phase_path = _resolve_phase_path()
     random.seed(42)  # reproducibility
     PORT = 1919
     N = 1000
@@ -71,6 +92,16 @@ async def main():
 
         logger.info(f"Start benchmarking with {len(TRACES)} requests using model {MODEL}...")
         for scale in SCALES:
+            start_ts_ns = time.time_ns()
+            _append_phase_manifest(
+                phase_path,
+                "bench_qwen_scale_start",
+                scale=scale,
+                prompt_mode=args.prompt_mode,
+                max_new_tokens=args.max_new_tokens,
+                model=MODEL,
+                start_ts_ns=start_ts_ns,
+            )
             traces = scale_traces(TRACES, scale)
             results = await benchmark_trace(
                 client,
@@ -79,6 +110,16 @@ async def main():
                 ignore_eos=args.prompt_mode != "real",
             )
             process_benchmark_results(results)
+            _append_phase_manifest(
+                phase_path,
+                "bench_qwen_scale_end",
+                scale=scale,
+                prompt_mode=args.prompt_mode,
+                max_new_tokens=args.max_new_tokens,
+                model=MODEL,
+                start_ts_ns=start_ts_ns,
+                end_ts_ns=time.time_ns(),
+            )
         logger.info("Benchmarking completed.")
 
 

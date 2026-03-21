@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from .cache import CacheManager
     from .decode import DecodeManager
+    from .metric_sink import SchedulerMetricSink
     from .table import TableManager
 
 logger = init_logger(__name__)
@@ -142,6 +143,7 @@ class PrefillManager:
     cache_manager: CacheManager
     table_manager: TableManager
     decode_manager: DecodeManager
+    metric_sink: SchedulerMetricSink
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
@@ -154,16 +156,45 @@ class PrefillManager:
             )
         )
 
+    def _emit_schedule_prefill(
+        self,
+        pending_req_count: int,
+        reserved_decode_tokens: int,
+        available_size: int,
+        adder: PrefillAdder,
+        admitted_req_count: int,
+        new_pending_list: List[PendingReq],
+    ) -> None:
+        stop_reason = "admitted_all"
+        if len(new_pending_list) > 0:
+            if adder.token_budget <= 0:
+                stop_reason = "token_budget"
+            elif self.table_manager.available_size == 0:
+                stop_reason = "table_full"
+            else:
+                stop_reason = "memory"
+        self.metric_sink.emit(
+            "prefill_schedule",
+            pending_req_count=pending_req_count,
+            reserved_decode_tokens=reserved_decode_tokens,
+            available_size=available_size,
+            admitted_req_count=admitted_req_count,
+            stop_reason=stop_reason,
+        )
+
     def schedule_next_batch(
         self,
         prefill_budget: int,
     ) -> Batch | None:
         if len(self.pending_list) == 0:
             return None
+        pending_req_count = len(self.pending_list)
+        reserved_decode_tokens = self.decode_manager.estimated_inflight_tokens
+        available_size = self.cache_manager.available_size
 
         adder = PrefillAdder(
             token_budget=prefill_budget,
-            reserved_size=self.decode_manager.estimated_inflight_tokens,
+            reserved_size=reserved_decode_tokens,
             clip_max_new_tokens=self.decode_manager.clip_max_new_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
@@ -179,9 +210,18 @@ class PrefillManager:
                 reqs.append(req)
             else:
                 break  # We cannot add more requests
+        new_pending_list = chunked_list + self.pending_list[len(reqs) :]
+        self._emit_schedule_prefill(
+            pending_req_count=pending_req_count,
+            reserved_decode_tokens=reserved_decode_tokens,
+            available_size=available_size,
+            adder=adder,
+            admitted_req_count=len(reqs),
+            new_pending_list=new_pending_list,
+        )
         if len(reqs) == 0:
             return None
-        self.pending_list = chunked_list + self.pending_list[len(reqs) :]
+        self.pending_list = new_pending_list
         return Batch(reqs=reqs, phase="prefill")
 
     def abort_req(self, uid: int) -> Req | None:
