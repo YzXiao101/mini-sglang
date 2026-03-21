@@ -30,6 +30,13 @@ class ChunkedReq(Req):
         return False  # avoid being added to decode manager
 
 
+@dataclass(frozen=True)
+class RejectInfo:
+    required_size: int
+    reserved_size: int
+    available_size: int
+
+
 @dataclass
 class PrefillAdder:
     token_budget: int
@@ -37,6 +44,7 @@ class PrefillAdder:
     clip_max_new_tokens: int
     cache_manager: CacheManager
     table_manager: TableManager
+    reject_info: RejectInfo | None = field(default=None, init=False)
 
     def _get_required_size(self, req: PendingReq, cached_len: int, chunk_size: int) -> int:
         if cached_len + chunk_size < req.input_len:
@@ -47,27 +55,43 @@ class PrefillAdder:
             added_len = chunk_size + min(req.output_len, self.clip_max_new_tokens)
         return alloc_delta(cached_len, added_len, self.cache_manager.page_size)
 
-    def _can_add_one(self, req: PendingReq, cached_len: int) -> int | None:
+    def _can_add_one(
+        self,
+        req: PendingReq,
+        cached_len: int,
+        *,
+        record_reject: bool = False,
+    ) -> int | None:
         chunk_size = min(self.token_budget, req.input_len - cached_len)
         required_size = self._get_required_size(req, cached_len, chunk_size)
-        return (
-            None
-            if required_size + self.reserved_size > self.cache_manager.available_size
-            else required_size
-        )
+        available_size = self.cache_manager.available_size
+        if required_size + self.reserved_size > available_size:
+            if record_reject:
+                self.reject_info = RejectInfo(
+                    required_size=required_size,
+                    reserved_size=self.reserved_size,
+                    available_size=available_size,
+                )
+            return None
+        return required_size
 
-    def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int, int] | None:
+    def _try_allocate_one(
+        self,
+        req: PendingReq,
+        *,
+        record_reject: bool = False,
+    ) -> Tuple[BaseCacheHandle, int, int] | None:
         if self.table_manager.available_size == 0:
             return None
 
         # TODO: consider host cache match case
         handle = self.cache_manager.match_req(req).cuda_handle
         cached_len = handle.cached_len
-        required_size = self._can_add_one(req, cached_len)
+        required_size = self._can_add_one(req, cached_len, record_reject=record_reject)
         if required_size is None:
             return None
         self.cache_manager.lock(handle)
-        required_size = self._can_add_one(req, cached_len)
+        required_size = self._can_add_one(req, cached_len, record_reject=record_reject)
         if required_size is None:
             return self.cache_manager.unlock(handle)
 
@@ -110,11 +134,16 @@ class PrefillAdder:
         )
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
+        self.reject_info = None
         if self.token_budget <= 0:
             return None
 
         if chunked_req := pending_req.chunked_req:
-            required_size = self._can_add_one(pending_req, chunked_req.cached_len)
+            required_size = self._can_add_one(
+                pending_req,
+                chunked_req.cached_len,
+                record_reject=True,
+            )
             if required_size is None:
                 return None
             return self._add_one_req(
@@ -125,7 +154,7 @@ class PrefillAdder:
                 required_size=required_size,
             )
 
-        if resource := self._try_allocate_one(pending_req):
+        if resource := self._try_allocate_one(pending_req, record_reject=True):
             cache_handle, table_idx, required_size = resource
             return self._add_one_req(
                 pending_req=pending_req,
@@ -136,6 +165,27 @@ class PrefillAdder:
             )
 
         return None
+
+    def would_fit(self, pending_req: PendingReq) -> bool:
+        if self.token_budget <= 0:
+            return False
+
+        if chunked_req := pending_req.chunked_req:
+            return self._can_add_one(pending_req, chunked_req.cached_len) is not None
+
+        if self.table_manager.available_size == 0:
+            return False
+
+        handle = self.cache_manager.match_req(pending_req).cuda_handle
+        cached_len = handle.cached_len
+        if self._can_add_one(pending_req, cached_len) is None:
+            return False
+
+        self.cache_manager.lock(handle)
+        try:
+            return self._can_add_one(pending_req, cached_len) is not None
+        finally:
+            self.cache_manager.unlock(handle)
 
 
 @dataclass
@@ -164,6 +214,8 @@ class PrefillManager:
         adder: PrefillAdder,
         admitted_req_count: int,
         new_pending_list: List[PendingReq],
+        blocked_info: RejectInfo | None,
+        later_fittable_exists: bool | None,
     ) -> None:
         stop_reason = "admitted_all"
         if len(new_pending_list) > 0:
@@ -180,6 +232,16 @@ class PrefillManager:
             available_size=available_size,
             admitted_req_count=admitted_req_count,
             stop_reason=stop_reason,
+            blocked_required_size=(
+                None if blocked_info is None else blocked_info.required_size
+            ),
+            blocked_reserved_size=(
+                None if blocked_info is None else blocked_info.reserved_size
+            ),
+            blocked_available_size=(
+                None if blocked_info is None else blocked_info.available_size
+            ),
+            later_fittable_exists=later_fittable_exists,
         )
 
     def schedule_next_batch(
@@ -201,7 +263,9 @@ class PrefillManager:
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []
-        for pending_req in self.pending_list:
+        blocked_info = None
+        later_fittable_exists = None
+        for i, pending_req in enumerate(self.pending_list):
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
                 if isinstance(req, ChunkedReq):
@@ -209,6 +273,11 @@ class PrefillManager:
                     chunked_list.append(pending_req)
                 reqs.append(req)
             else:
+                blocked_info = adder.reject_info
+                if blocked_info is not None:
+                    later_fittable_exists = any(
+                        adder.would_fit(later_req) for later_req in self.pending_list[i + 1 :]
+                    )
                 break  # We cannot add more requests
         new_pending_list = chunked_list + self.pending_list[len(reqs) :]
         self._emit_schedule_prefill(
@@ -218,6 +287,8 @@ class PrefillManager:
             adder=adder,
             admitted_req_count=len(reqs),
             new_pending_list=new_pending_list,
+            blocked_info=blocked_info,
+            later_fittable_exists=later_fittable_exists,
         )
         if len(reqs) == 0:
             return None
