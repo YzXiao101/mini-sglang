@@ -54,100 +54,102 @@ class GrammarManager:
 
     def submit(self, req: PendingReq) -> GrammarSubmitStatus:
         assert req.constraint is not None
-        key = self._get_grammar_key(req)
-        req.constraint.grammar_key = key
+        with torch.profiler.record_function("grammar_submit"):
+            key = self._get_grammar_key(req)
+            req.constraint.grammar_key = key
 
-        backend = self.grammar_backend
-        if backend is None:
-            req.constraint.grammar = None
-            return GRAMMAR_FAILED
-
-        value, cache_hit = backend.get_cached_or_future_value(key)
-        req.constraint.grammar = value
-        if cache_hit:
-            if value is INVALID_GRAMMAR_OBJ:
+            backend = self.grammar_backend
+            if backend is None:
                 req.constraint.grammar = None
                 return GRAMMAR_FAILED
-            return GRAMMAR_READY
 
-        self.grammar_queue.append(req)
-        return GRAMMAR_QUEUED
+            value, cache_hit = backend.get_cached_or_future_value(key)
+            req.constraint.grammar = value
+            if cache_hit:
+                if value is INVALID_GRAMMAR_OBJ:
+                    req.constraint.grammar = None
+                    return GRAMMAR_FAILED
+                return GRAMMAR_READY
+
+            self.grammar_queue.append(req)
+            return GRAMMAR_QUEUED
 
     def poll_ready(self) -> GrammarPollResult:
-        ready_uids: Set[int] = set()
-        failed_uids: Set[int] = set()
-        ready_values: dict[int, BaseGrammarObject] = {}
+        with torch.profiler.record_function("grammar_poll_ready"):
+            ready_uids: Set[int] = set()
+            failed_uids: Set[int] = set()
+            ready_values: dict[int, BaseGrammarObject] = {}
 
-        deadline = time.perf_counter() + self.poll_interval
-        while True:
-            timeout = time.perf_counter() >= deadline
+            deadline = time.perf_counter() + self.poll_interval
+            while True:
+                timeout = time.perf_counter() >= deadline
+                for req in self.grammar_queue:
+                    uid = req.uid
+                    if uid in ready_uids or uid in failed_uids:
+                        continue
+
+                    assert req.constraint is not None
+                    grammar = req.constraint.grammar
+                    assert isinstance(grammar, futures.Future)
+                    if grammar.done():
+                        value = grammar.result()
+                        if value is INVALID_GRAMMAR_OBJ:
+                            failed_uids.add(uid)
+                        else:
+                            ready_uids.add(uid)
+                            ready_values[uid] = value
+                    elif timeout:
+                        req.constraint.grammar_wait_ct += 1
+                        if req.constraint.grammar_wait_ct >= self.max_poll_iterations:
+                            failed_uids.add(uid)
+
+                if timeout:
+                    break
+                time.sleep(self.poll_interval / 10)
+
+            if self.tp_size > 1:
+                gathered: List[Tuple[Set[int], Set[int]] | None] = [None] * self.tp_size
+                torch.distributed.all_gather_object(
+                    gathered,
+                    (ready_uids, failed_uids),
+                    group=self.tp_cpu_group,
+                )
+                ready_uids = set.intersection(*(x[0] for x in gathered if x is not None))
+                failed_uids = set.union(*(x[1] for x in gathered if x is not None))
+
+            ready_uids -= failed_uids
+            backend = self.grammar_backend
+            ready_reqs: List[PendingReq] = []
+            failed_list: List[int] = []
+            next_queue: List[PendingReq] = []
+
             for req in self.grammar_queue:
                 uid = req.uid
-                if uid in ready_uids or uid in failed_uids:
+                assert req.constraint is not None
+                key = req.constraint.grammar_key
+                grammar = req.constraint.grammar
+
+                if uid in failed_uids:
+                    if isinstance(grammar, futures.Future):
+                        grammar.cancel()
+                    if backend is not None and key is not None:
+                        backend.set_cache(key, INVALID_GRAMMAR_OBJ)
+                    req.constraint.grammar = None
+                    failed_list.append(uid)
                     continue
 
-                assert req.constraint is not None
-                grammar = req.constraint.grammar
-                assert isinstance(grammar, futures.Future)
-                if grammar.done():
-                    value = grammar.result()
-                    if value is INVALID_GRAMMAR_OBJ:
-                        failed_uids.add(uid)
-                    else:
-                        ready_uids.add(uid)
-                        ready_values[uid] = value
-                elif timeout:
-                    req.constraint.grammar_wait_ct += 1
-                    if req.constraint.grammar_wait_ct >= self.max_poll_iterations:
-                        failed_uids.add(uid)
+                if uid in ready_uids:
+                    value = ready_values[uid]
+                    req.constraint.grammar = value
+                    if backend is not None and key is not None:
+                        backend.set_cache(key, value.copy())
+                    ready_reqs.append(req)
+                    continue
 
-            if timeout:
-                break
-            time.sleep(self.poll_interval / 10)
+                next_queue.append(req)
 
-        if self.tp_size > 1:
-            gathered: List[Tuple[Set[int], Set[int]] | None] = [None] * self.tp_size
-            torch.distributed.all_gather_object(
-                gathered,
-                (ready_uids, failed_uids),
-                group=self.tp_cpu_group,
-            )
-            ready_uids = set.intersection(*(x[0] for x in gathered if x is not None))
-            failed_uids = set.union(*(x[1] for x in gathered if x is not None))
-
-        ready_uids -= failed_uids
-        backend = self.grammar_backend
-        ready_reqs: List[PendingReq] = []
-        failed_list: List[int] = []
-        next_queue: List[PendingReq] = []
-
-        for req in self.grammar_queue:
-            uid = req.uid
-            assert req.constraint is not None
-            key = req.constraint.grammar_key
-            grammar = req.constraint.grammar
-
-            if uid in failed_uids:
-                if isinstance(grammar, futures.Future):
-                    grammar.cancel()
-                if backend is not None and key is not None:
-                    backend.set_cache(key, INVALID_GRAMMAR_OBJ)
-                req.constraint.grammar = None
-                failed_list.append(uid)
-                continue
-
-            if uid in ready_uids:
-                value = ready_values[uid]
-                req.constraint.grammar = value
-                if backend is not None and key is not None:
-                    backend.set_cache(key, value.copy())
-                ready_reqs.append(req)
-                continue
-
-            next_queue.append(req)
-
-        self.grammar_queue = next_queue
-        return GrammarPollResult(ready_reqs=ready_reqs, failed_uids=failed_list)
+            self.grammar_queue = next_queue
+            return GrammarPollResult(ready_reqs=ready_reqs, failed_uids=failed_list)
 
     def abort_req(self, uid: int) -> bool:
         for i, req in enumerate(self.grammar_queue):

@@ -178,43 +178,44 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
-        copy_done.synchronize()
-        reply: List[DetokenizeMsg] = []
-        with self.cache_manager.lazy_free_region():
-            for i, req in enumerate(batch.reqs):
-                if req.finished:
-                    continue
-                if isinstance(req, ChunkedReq):
-                    continue
+        with torch.profiler.record_function("scheduler_process_last_data"):
+            batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+            copy_done.synchronize()
+            reply: List[DetokenizeMsg] = []
+            with self.cache_manager.lazy_free_region():
+                for i, req in enumerate(batch.reqs):
+                    if req.finished:
+                        continue
+                    if isinstance(req, ChunkedReq):
+                        continue
 
-                next_token = next_tokens_cpu[i]
-                next_token_id = int(next_token.item())
-                reply_token_id = next_token_id
-                append_token = True
+                    next_token = next_tokens_cpu[i]
+                    next_token_id = int(next_token.item())
+                    reply_token_id = next_token_id
+                    append_token = True
 
-                if req.is_constrained:
-                    try:
-                        finished = self._accept_grammar_token(req, next_token_id)
-                    except ValueError:
-                        finished = True
-                        reply_token_id = self.eos_token_id
-                        append_token = False
-                else:
-                    finished = req.should_finish(next_token_id, self.eos_token_id)
+                    if req.is_constrained:
+                        try:
+                            finished = self._accept_grammar_token(req, next_token_id)
+                        except ValueError:
+                            finished = True
+                            reply_token_id = self.eos_token_id
+                            append_token = False
+                    else:
+                        finished = req.should_finish(next_token_id, self.eos_token_id)
 
-                if append_token:
-                    req.append_host(next_token.unsqueeze(0))
+                    if append_token:
+                        req.append_host(next_token.unsqueeze(0))
 
-                reply.append(
-                    DetokenizeMsg(uid=req.uid, next_token=reply_token_id, finished=finished)
-                )
+                    reply.append(
+                        DetokenizeMsg(uid=req.uid, next_token=reply_token_id, finished=finished)
+                    )
 
-                if finished:
-                    self._finish_req(req)
-                elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
-                    self.cache_manager.cache_req(req, finished=False)
-        self.send_result(reply)
+                    if finished:
+                        self._finish_req(req)
+                    elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
+                        self.cache_manager.cache_req(req, finished=False)
+            self.send_result(reply)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
@@ -260,19 +261,20 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
-        self.engine.graph_runner.pad_batch(batch)
-        self.cache_manager.allocate_paged(batch.reqs)
-        batch.positions = _make_positions(batch, self.device)
-        input_mapping = _make_input_tuple(batch, self.device)
-        write_mapping = _make_write_tuple(batch, self.device)
-        batch.out_loc = self.engine.page_table[input_mapping]
-        self.engine.attn_backend.prepare_metadata(batch)
-        return ForwardInput(
-            batch=batch,
-            sample_args=self.engine.sampler.prepare(batch),
-            input_tuple=input_mapping,
-            write_tuple=write_mapping,
-        )
+        with torch.profiler.record_function("scheduler_prepare_batch"):
+            self.engine.graph_runner.pad_batch(batch)
+            self.cache_manager.allocate_paged(batch.reqs)
+            batch.positions = _make_positions(batch, self.device)
+            input_mapping = _make_input_tuple(batch, self.device)
+            write_mapping = _make_write_tuple(batch, self.device)
+            batch.out_loc = self.engine.page_table[input_mapping]
+            self.engine.attn_backend.prepare_metadata(batch)
+            return ForwardInput(
+                batch=batch,
+                sample_args=self.engine.sampler.prepare(batch),
+                input_tuple=input_mapping,
+                write_tuple=write_mapping,
+            )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         self._poll_grammar_queue()

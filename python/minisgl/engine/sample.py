@@ -65,16 +65,17 @@ class Sampler:
         if first_grammar is None:
             return
 
-        vocab_mask = first_grammar.allocate_vocab_mask(
-            vocab_size=self.vocab_size,
-            batch_size=len(grammars),
-            device=logits.device,
-        )
-        for i, grammar in enumerate(grammars):
-            if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(vocab_mask, i)
-        vocab_mask = first_grammar.move_vocab_mask(vocab_mask, logits.device)
-        first_grammar.apply_vocab_mask(logits, vocab_mask)
+        with torch.profiler.record_function("apply_grammar_mask"):
+            vocab_mask = first_grammar.allocate_vocab_mask(
+                vocab_size=self.vocab_size,
+                batch_size=len(grammars),
+                device=logits.device,
+            )
+            for i, grammar in enumerate(grammars):
+                if grammar and not grammar.finished and not grammar.is_terminated():
+                    grammar.fill_vocab_mask(vocab_mask, i)
+            vocab_mask = first_grammar.move_vocab_mask(vocab_mask, logits.device)
+            first_grammar.apply_vocab_mask(logits, vocab_mask)
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]

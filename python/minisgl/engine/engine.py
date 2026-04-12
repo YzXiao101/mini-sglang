@@ -207,10 +207,11 @@ class Engine:
 
     def forward_batch(self, batch: Batch) -> ModelForwardOutput:
         assert torch.cuda.current_stream() == self.stream
-        with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
-                return ModelForwardOutput(self.graph_runner.replay(batch))
-            return ModelForwardOutput(self.model.forward())
+        with torch.profiler.record_function("engine_forward_batch"):
+            with self.ctx.forward_batch(batch):
+                if self.graph_runner.can_use_cuda_graph(batch):
+                    return ModelForwardOutput(self.graph_runner.replay(batch))
+                return ModelForwardOutput(self.model.forward())
 
     def sample_batch(
         self,
@@ -218,17 +219,18 @@ class Engine:
         forward_output: ModelForwardOutput,
         args: BatchSamplingArgs,
     ) -> ForwardOutput:
-        for req in batch.reqs:
-            req.complete_one()
+        with torch.profiler.record_function("engine_sample_batch"):
+            for req in batch.reqs:
+                req.complete_one()
 
-        next_tokens_gpu = self.sampler.sample(forward_output.logits[: batch.size], args).to(
-            torch.int32
-        )
-        self._sync_next_tokens(next_tokens_gpu, args)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+            next_tokens_gpu = self.sampler.sample(forward_output.logits[: batch.size], args).to(
+                torch.int32
+            )
+            self._sync_next_tokens(next_tokens_gpu, args)
+            next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+            copy_done_event = torch.cuda.Event()
+            copy_done_event.record(self.stream)
+            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()

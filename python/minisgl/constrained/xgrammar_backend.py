@@ -147,17 +147,18 @@ class XGrammarBackend(BaseGrammarBackend):
         )
 
     def dispatch_json(self, key_string: str) -> BaseGrammarObject | None:
-        try:
-            if key_string == "$$ANY$$":
-                ctx = self.grammar_compiler.compile_builtin_json_grammar()
-            else:
-                ctx = self.grammar_compiler.compile_json_schema(
-                    schema=key_string,
-                    any_whitespace=self.any_whitespace,
-                )
-        except (RuntimeError, json.decoder.JSONDecodeError, UnicodeDecodeError):
-            return INVALID_GRAMMAR_OBJ
-        return self._from_context(ctx, key_string)
+        with torch.profiler.record_function("compile_json_schema"):
+            try:
+                if key_string == "$$ANY$$":
+                    ctx = self.grammar_compiler.compile_builtin_json_grammar()
+                else:
+                    ctx = self.grammar_compiler.compile_json_schema(
+                        schema=key_string,
+                        any_whitespace=self.any_whitespace,
+                    )
+            except (RuntimeError, json.decoder.JSONDecodeError, UnicodeDecodeError):
+                return INVALID_GRAMMAR_OBJ
+            return self._from_context(ctx, key_string)
 
     def reset(self) -> None:
         super().reset()
