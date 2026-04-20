@@ -27,6 +27,9 @@ class BaseGrammarObject:
     ) -> torch.Tensor:
         raise NotImplementedError()
 
+    def reset_vocab_mask(self, vocab_mask: torch.Tensor) -> None:
+        raise NotImplementedError()
+
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         raise NotImplementedError()
 

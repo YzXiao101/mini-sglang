@@ -9,6 +9,7 @@ from xgrammar import (
     GrammarMatcher,
     TokenizerInfo,
     allocate_token_bitmask,
+    reset_token_bitmask,
 )
 
 from .base import INVALID_GRAMMAR_OBJ, BaseGrammarBackend, BaseGrammarObject
@@ -65,6 +66,9 @@ class XGrammarGrammar(BaseGrammarObject):
         self, vocab_size: int, batch_size: int, device: torch.device
     ) -> torch.Tensor:
         return allocate_token_bitmask(batch_size, vocab_size)
+
+    def reset_vocab_mask(self, vocab_mask: torch.Tensor) -> None:
+        reset_token_bitmask(vocab_mask)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
