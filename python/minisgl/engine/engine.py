@@ -220,13 +220,12 @@ class Engine:
         args: BatchSamplingArgs,
     ) -> ForwardOutput:
         with torch.profiler.record_function("engine_sample_batch"):
-            for req in batch.reqs:
-                req.complete_one()
-
             next_tokens_gpu = self.sampler.sample(forward_output.logits[: batch.size], args).to(
                 torch.int32
             )
             self._sync_next_tokens(next_tokens_gpu, args)
+            for req in batch.reqs:
+                req.advance_token()
             next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
             copy_done_event = torch.cuda.Event()
             copy_done_event.record(self.stream)
