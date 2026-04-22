@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -55,8 +55,6 @@ def sample_impl(
 class Sampler:
     device: torch.device
     vocab_size: int
-    max_running_req: int
-    vocab_mask_cpu: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def _apply_grammar_mask(self, logits: torch.Tensor, args: BatchSamplingArgs) -> None:
         grammars = args.grammars
@@ -68,14 +66,11 @@ class Sampler:
             return
 
         with torch.profiler.record_function("apply_grammar_mask"):
-            if self.vocab_mask_cpu is None:
-                self.vocab_mask_cpu = first_grammar.allocate_vocab_mask(
-                    vocab_size=self.vocab_size,
-                    batch_size=self.max_running_req,
-                    device=logits.device,
-                )
-            vocab_mask = self.vocab_mask_cpu[: len(grammars)]
-            first_grammar.reset_vocab_mask(vocab_mask)
+            vocab_mask = first_grammar.allocate_vocab_mask(
+                vocab_size=self.vocab_size,
+                batch_size=len(grammars),
+                device=logits.device,
+            )
             for i, grammar in enumerate(grammars):
                 if grammar and not grammar.finished and not grammar.is_terminated():
                     grammar.fill_vocab_mask(vocab_mask, i)
