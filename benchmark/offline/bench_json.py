@@ -18,6 +18,7 @@ from minisgl.llm import LLM
 from transformers import AutoTokenizer
 
 _PROFILE_ROW_LIMIT = 200
+_DEFAULT_MODEL = "Qwen/Qwen2-0.5B"
 
 
 def print_len_stats(name: str, lengths: list[int]) -> None:
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-seqs", type=int, default=100)
     parser.add_argument("--max-output-len", type=int, default=4096)
+    parser.add_argument("--model", default=_DEFAULT_MODEL)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--disable-cuda-graph-for-profile", action="store_true")
@@ -111,10 +113,10 @@ def main() -> None:
 
     seed(0)
     # NOTE: Using a small, unaligned model makes the diff easier to observe
-    MODEL = "Qwen/Qwen2-0.5B"
+    model = args.model
     IGNORE_EOS = False
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    tokenizer = AutoTokenizer.from_pretrained(model)
     samples = collect_filtered_json_samples(args.num_seqs)
     prompt_token_ids = [render_json_prompt_ids(tokenizer, sample) for sample in samples]
 
@@ -133,55 +135,62 @@ def main() -> None:
     llm_kwargs = {}
     if args.disable_cuda_graph_for_profile:
         llm_kwargs["cuda_graph_max_bs"] = 0
-    llm = LLM(MODEL, **llm_kwargs)
+    llm = LLM(model, **llm_kwargs)
+    try:
+        warmup_result = llm.generate(
+            [prompt_token_ids[-1]],
+            sampling_params[-1],
+        )[0]
+        templated_input_preview = tokenizer.decode(
+            prompt_token_ids[-1],
+            skip_special_tokens=False,
+        )
+        templated_input_preview = templated_input_preview.replace("\n", "\\n")
+        warmup_token_ids = warmup_result["token_ids"]
+        warmup_text = warmup_result["text"]
+        print(
+            "Warmup sample: "
+            f"mode={args.mode}, "
+            f"input={len(prompt_token_ids[-1])}tok, "
+            f"templated_input_preview='{templated_input_preview}', "
+            f"output={len(warmup_token_ids)}tok, "
+            f"preview='{warmup_text}'"
+        )
 
-    warmup_result = llm.generate(
-        [prompt_token_ids[-1]],
-        sampling_params[-1],
-    )[0]
-    templated_input_preview = tokenizer.decode(
-        prompt_token_ids[-1],
-        skip_special_tokens=False,
-    )
-    templated_input_preview = templated_input_preview.replace("\n", "\\n")
-    warmup_token_ids = warmup_result["token_ids"]
-    warmup_text = warmup_result["text"]
-    print(
-        "Warmup sample: "
-        f"mode={args.mode}, "
-        f"input={len(prompt_token_ids[-1])}tok, "
-        f"templated_input_preview='{templated_input_preview}', "
-        f"output={len(warmup_token_ids)}tok, "
-        f"preview='{warmup_text}'"
-    )
+        bench_results, t = _run_bench(llm, prompt_token_ids, sampling_params, args)
 
-    bench_results, t = _run_bench(llm, prompt_token_ids, sampling_params, args)
+        output_lens = []
+        parse_ok = 0
+        schema_ok = 0
+        schema_checked = 0
+        for sample, result in zip(samples, bench_results):
+            token_ids = result["token_ids"]
+            output_lens.append(len(token_ids))
+            parsed, valid = validate_json_output(result["text"], sample.json_schema)
+            parse_ok += int(parsed)
+            if valid is not None:
+                schema_checked += 1
+                schema_ok += int(valid)
 
-    output_lens = []
-    parse_ok = 0
-    schema_ok = 0
-    schema_checked = 0
-    for sample, result in zip(samples, bench_results):
-        token_ids = result["token_ids"]
-        output_lens.append(len(token_ids))
-        parsed, valid = validate_json_output(result["text"], sample.json_schema)
-        parse_ok += int(parsed)
-        if valid is not None:
-            schema_checked += 1
-            schema_ok += int(valid)
+        total_output_budget = sum(sp.max_tokens for sp in sampling_params)
+        total_output_tokens = sum(output_lens)
 
-    total_output_budget = sum(sp.max_tokens for sp in sampling_params)
-    total_output_tokens = sum(output_lens)
-
-    print(f"Mode: {args.mode}")
-    print_len_stats("Input length", [len(x) for x in prompt_token_ids])
-    print_len_stats("Output length", output_lens)
-    print(f"Bench requests: {len(prompt_token_ids)}")
-    print(f"Output budget: {total_output_budget}tok, " f"Actual output: {total_output_tokens}tok")
-    print(f"JSON parse: {parse_ok}/{len(bench_results)}")
-    print(f"Schema valid: {schema_ok}/{schema_checked}")
-    throughput = total_output_tokens / t if t > 0 else 0.0
-    print(f"Total: {total_output_tokens}tok, Time: {t:.2f}s, " f"Throughput: {throughput:.2f}tok/s")
+        print(f"Mode: {args.mode}")
+        print_len_stats("Input length", [len(x) for x in prompt_token_ids])
+        print_len_stats("Output length", output_lens)
+        print(f"Bench requests: {len(prompt_token_ids)}")
+        print(
+            f"Output budget: {total_output_budget}tok, " f"Actual output: {total_output_tokens}tok"
+        )
+        print(f"JSON parse: {parse_ok}/{len(bench_results)}")
+        print(f"Schema valid: {schema_ok}/{schema_checked}")
+        throughput = total_output_tokens / t if t > 0 else 0.0
+        print(
+            f"Total: {total_output_tokens}tok, Time: {t:.2f}s, "
+            f"Throughput: {throughput:.2f}tok/s"
+        )
+    finally:
+        llm.shutdown()
 
 
 if __name__ == "__main__":
