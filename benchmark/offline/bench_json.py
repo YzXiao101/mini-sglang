@@ -4,6 +4,7 @@ import argparse
 import time
 from random import seed
 
+import torch
 from minisgl.benchmark.json import (
     collect_filtered_json_samples,
     render_json_prompt_ids,
@@ -33,6 +34,10 @@ def parse_args() -> argparse.Namespace:
         choices=["constrained", "unconstrained"],
         default="constrained",
     )
+    parser.add_argument("--num-seqs", type=int, default=100)
+    parser.add_argument("--max-output-len", type=int, default=4096)
+    parser.add_argument("--disable-cuda-graph-for-profile", action="store_true")
+    parser.add_argument("--cuda-profiler-range", action="store_true")
     return parser.parse_args()
 
 
@@ -42,8 +47,8 @@ def main() -> None:
     seed(0)
     # NOTE: Using a small, unaligned model makes the diff easier to observe
     MODEL = "Qwen/Qwen2-0.5B"
-    NUM_SEQS = 100
-    MAX_OUTPUT_LEN = 4096
+    NUM_SEQS = args.num_seqs
+    MAX_OUTPUT_LEN = args.max_output_len
     IGNORE_EOS = False
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
@@ -65,7 +70,7 @@ def main() -> None:
             )
         )
 
-    llm = LLM(MODEL)
+    llm = LLM(MODEL, cuda_graph_max_bs=0) if args.disable_cuda_graph_for_profile else LLM(MODEL)
 
     warmup_result = llm.generate(
         [prompt_token_ids[-1]],
@@ -87,9 +92,17 @@ def main() -> None:
         f"preview='{warmup_text}'"
     )
 
-    t = time.time()
-    bench_results = llm.generate(prompt_token_ids, sampling_params)
-    t = time.time() - t
+    if args.cuda_profiler_range:
+        torch.cuda.profiler.start()
+    try:
+        t = time.time()
+        bench_results = llm.generate(prompt_token_ids, sampling_params)
+        t = time.time() - t
+        if args.cuda_profiler_range:
+            torch.cuda.synchronize(llm.device)
+    finally:
+        if args.cuda_profiler_range:
+            torch.cuda.profiler.stop()
 
     output_lens = []
     parse_ok = 0
