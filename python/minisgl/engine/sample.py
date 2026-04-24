@@ -66,16 +66,19 @@ class Sampler:
             return
 
         with torch.cuda.nvtx.range("apply_grammar_mask"):
-            vocab_mask = first_grammar.allocate_vocab_mask(
-                vocab_size=self.vocab_size,
-                batch_size=len(grammars),
-                device=logits.device,
-            )
-            for i, grammar in enumerate(grammars):
-                if grammar and not grammar.finished and not grammar.is_terminated():
-                    grammar.fill_vocab_mask(vocab_mask, i)
-            vocab_mask = first_grammar.move_vocab_mask(vocab_mask, logits.device)
-            first_grammar.apply_vocab_mask(logits, vocab_mask)
+            with torch.cuda.nvtx.range("allocate_vocab_mask"):
+                vocab_mask = first_grammar.allocate_vocab_mask(
+                    vocab_size=self.vocab_size,
+                    batch_size=len(grammars),
+                    device=logits.device,
+                )
+            with torch.cuda.nvtx.range("fill_vocab_mask"):
+                for i, grammar in enumerate(grammars):
+                    if grammar and not grammar.finished and not grammar.is_terminated():
+                        grammar.fill_vocab_mask(vocab_mask, i)
+            with torch.cuda.nvtx.range("move_apply_vocab_mask"):
+                vocab_mask = first_grammar.move_vocab_mask(vocab_mask, logits.device)
+                first_grammar.apply_vocab_mask(logits, vocab_mask)
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
