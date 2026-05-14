@@ -109,6 +109,7 @@ class Scheduler(SchedulerIOMixin):
         ongoing_data: ForwardData | None = None
         pending_data: PendingData | None = None
         if forward_input is not None:
+            self._before_forward_batch(forward_input)
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
                 if self._should_delay_sampling(forward_input, last_data):
@@ -137,6 +138,7 @@ class Scheduler(SchedulerIOMixin):
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
+            self._before_forward_batch(forward_input)
             ongoing_data = (forward_input, self._forward(forward_input))
 
         self._process_last_data(ongoing_data)
@@ -159,6 +161,9 @@ class Scheduler(SchedulerIOMixin):
         self.sync_all_ranks()
         self.grammar_manager.shutdown()
         self.engine.shutdown()
+
+    def _before_forward_batch(self, forward_input: ForwardInput) -> None:
+        _ = forward_input
 
     def _accept_grammar_token(self, req: Req, next_token: int) -> bool:
         grammar = req.constraint.grammar

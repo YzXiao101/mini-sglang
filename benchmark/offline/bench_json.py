@@ -5,6 +5,7 @@ import json
 import time
 from pathlib import Path
 from random import seed
+from typing import Any
 
 import torch
 from minisgl.benchmark.json import (
@@ -19,6 +20,8 @@ from transformers import AutoTokenizer
 
 _PROFILE_ROW_LIMIT = 200
 _DEFAULT_MODEL = "Qwen/Qwen2-0.5B"
+_EMPTY_TRACE = '{"traceEvents":[]}\n'
+_EMPTY_PROFILE_MESSAGE = "No work reached requested profile step range.\n"
 
 
 def print_len_stats(name: str, lengths: list[int]) -> None:
@@ -46,10 +49,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--disable-cuda-graph-for-profile", action="store_true")
+    parser.add_argument("--profile-step-start", type=int)
+    parser.add_argument("--profile-step-end", type=int)
+    parser.add_argument(
+        "--profile-step-phase",
+        choices=["decode", "all"],
+        default="decode",
+    )
     args = parser.parse_args()
     if args.profile and args.profile_dir is None:
         parser.error("--profile requires --profile-dir")
+    if (args.profile_step_start is None) != (args.profile_step_end is None):
+        parser.error("--profile-step-start and --profile-step-end must be set together")
+    if args.profile_step_start is not None:
+        if not args.profile:
+            parser.error("--profile-step-start and --profile-step-end require --profile")
+        if args.profile_step_start < 1:
+            parser.error("--profile-step-start must be >= 1")
+        if args.profile_step_end < args.profile_step_start:
+            parser.error("--profile-step-end must be >= --profile-step-start")
     return args
+
+
+def _make_profiler() -> Any:
+    return torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        with_stack=False,
+        profile_memory=False,
+    )
+
+
+def _write_profile_outputs(output_dir: Path, prof: Any, profile_started: bool) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not profile_started:
+        (output_dir / "trace.json").write_text(_EMPTY_TRACE)
+        (output_dir / "cpu_table.txt").write_text(_EMPTY_PROFILE_MESSAGE)
+        (output_dir / "cuda_table.txt").write_text(_EMPTY_PROFILE_MESSAGE)
+        return
+
+    prof.export_chrome_trace(str(output_dir / "trace.json"))
+    events = prof.key_averages()
+    (output_dir / "cpu_table.txt").write_text(
+        events.table(sort_by="self_cpu_time_total", row_limit=_PROFILE_ROW_LIMIT)
+    )
+    (output_dir / "cuda_table.txt").write_text(
+        events.table(sort_by="self_cuda_time_total", row_limit=_PROFILE_ROW_LIMIT)
+    )
 
 
 def _run_bench(
@@ -63,28 +112,31 @@ def _run_bench(
         return llm.generate(prompt_token_ids, sampling_params), time.time() - t
 
     output_dir = args.profile_dir
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        record_shapes=True,
-        with_stack=False,
-        profile_memory=False,
-    ) as prof:
-        bench_results = llm.generate(prompt_token_ids, sampling_params)
-        torch.cuda.synchronize(llm.device)
+    prof = _make_profiler()
+    step_profile = args.profile_step_start is not None
+    profile_meta: dict[str, int | float | str | bool | None] | None = None
+    if step_profile:
+        llm.start_profile(
+            prof,
+            start_step=args.profile_step_start,
+            num_steps=args.profile_step_end - args.profile_step_start + 1,
+            phase=args.profile_step_phase,
+        )
+        try:
+            bench_results = llm.generate(prompt_token_ids, sampling_params)
+        finally:
+            profile_meta = llm.stop_profile().as_dict()
+    else:
+        prof.start()
+        try:
+            bench_results = llm.generate(prompt_token_ids, sampling_params)
+            torch.cuda.synchronize(llm.device)
+        finally:
+            prof.stop()
     elapsed = time.time() - t
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    prof.export_chrome_trace(str(output_dir / "trace.json"))
-    events = prof.key_averages()
-    (output_dir / "cpu_table.txt").write_text(
-        events.table(sort_by="self_cpu_time_total", row_limit=_PROFILE_ROW_LIMIT)
-    )
-    (output_dir / "cuda_table.txt").write_text(
-        events.table(sort_by="self_cuda_time_total", row_limit=_PROFILE_ROW_LIMIT)
-    )
+    profile_started = not step_profile or bool(profile_meta and profile_meta["profile_started"])
+    _write_profile_outputs(output_dir, prof, profile_started)
     (output_dir / "meta.txt").write_text(
         json.dumps(
             {
@@ -97,6 +149,11 @@ def _run_bench(
                 "max_output_len": args.max_output_len,
                 "overlap_enabled": not bool(ENV.DISABLE_OVERLAP_SCHEDULING),
                 "cuda_graph_max_bs": llm.engine.graph_runner.max_graph_bs,
+                "profile_scope": "step_range" if step_profile else "whole_run",
+                "profile_step_start": args.profile_step_start,
+                "profile_step_end": args.profile_step_end,
+                "profile_step_phase": args.profile_step_phase,
+                "step_profile": profile_meta,
                 "profile_row_limit": _PROFILE_ROW_LIMIT,
                 "profile_dir": str(output_dir),
             },
