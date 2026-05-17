@@ -117,7 +117,7 @@ def main() -> None:
         )
         with capture_range:
             with profile_range("bench_json:generate"):
-                if args.cuda_profiler_range:
+                if args.cuda_profiler_range or args.nsight_capture_range:
                     torch.cuda.profiler.start()
                 try:
                     t = time.time()
@@ -126,7 +126,7 @@ def main() -> None:
                     if args.cuda_profiler_range or args.nsight_capture_range:
                         torch.cuda.synchronize(llm.device)
                 finally:
-                    if args.cuda_profiler_range:
+                    if args.cuda_profiler_range or args.nsight_capture_range:
                         torch.cuda.profiler.stop()
     finally:
         if llm is not None:
