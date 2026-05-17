@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
+from contextlib import nullcontext
 from random import seed
+from typing import ContextManager
 
 import torch
 from minisgl.benchmark.json import (
@@ -29,6 +32,7 @@ def print_len_stats(name: str, lengths: list[int]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default=os.getenv("MODEL", "Qwen/Qwen2-0.5B"))
     parser.add_argument(
         "--mode",
         choices=["constrained", "unconstrained"],
@@ -38,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-output-len", type=int, default=4096)
     parser.add_argument("--disable-cuda-graph-for-profile", action="store_true")
     parser.add_argument("--cuda-profiler-range", action="store_true")
+    parser.add_argument("--nsight-capture-range", default=None)
     return parser.parse_args()
 
 
@@ -45,8 +50,7 @@ def main() -> None:
     args = parse_args()
 
     seed(0)
-    # NOTE: Using a small, unaligned model makes the diff easier to observe
-    MODEL = "Qwen/Qwen2-0.5B"
+    MODEL = args.model
     NUM_SEQS = args.num_seqs
     MAX_OUTPUT_LEN = args.max_output_len
     IGNORE_EOS = False
@@ -70,39 +74,58 @@ def main() -> None:
             )
         )
 
-    llm = LLM(MODEL, cuda_graph_max_bs=0) if args.disable_cuda_graph_for_profile else LLM(MODEL)
-
-    warmup_result = llm.generate(
-        [prompt_token_ids[-1]],
-        sampling_params[-1],
-    )[0]
-    templated_input_preview = tokenizer.decode(
-        prompt_token_ids[-1],
-        skip_special_tokens=False,
-    )
-    templated_input_preview = templated_input_preview.replace("\n", "\\n")
-    warmup_token_ids = warmup_result["token_ids"]
-    warmup_text = warmup_result["text"]
-    print(
-        "Warmup sample: "
-        f"mode={args.mode}, "
-        f"input={len(prompt_token_ids[-1])}tok, "
-        f"templated_input_preview='{templated_input_preview}', "
-        f"output={len(warmup_token_ids)}tok, "
-        f"preview='{warmup_text}'"
+    capture_ctx = (
+        torch.cuda.nvtx.range(args.nsight_capture_range)
+        if args.nsight_capture_range
+        else nullcontext()
     )
 
-    if args.cuda_profiler_range:
-        torch.cuda.profiler.start()
-    try:
-        t = time.time()
-        bench_results = llm.generate(prompt_token_ids, sampling_params)
-        t = time.time() - t
-        if args.cuda_profiler_range:
-            torch.cuda.synchronize(llm.device)
-    finally:
-        if args.cuda_profiler_range:
-            torch.cuda.profiler.stop()
+    def profile_range(name: str) -> ContextManager[None]:
+        if args.nsight_capture_range:
+            return torch.cuda.nvtx.range(name)
+        return nullcontext()
+
+    with capture_ctx:
+        with profile_range("bench_json:init_llm"):
+            llm = (
+                LLM(MODEL, cuda_graph_max_bs=0)
+                if args.disable_cuda_graph_for_profile
+                else LLM(MODEL)
+            )
+
+        with profile_range("bench_json:warmup"):
+            warmup_result = llm.generate(
+                [prompt_token_ids[-1]],
+                sampling_params[-1],
+            )[0]
+        templated_input_preview = tokenizer.decode(
+            prompt_token_ids[-1],
+            skip_special_tokens=False,
+        )
+        templated_input_preview = templated_input_preview.replace("\n", "\\n")
+        warmup_token_ids = warmup_result["token_ids"]
+        warmup_text = warmup_result["text"]
+        print(
+            "Warmup sample: "
+            f"mode={args.mode}, "
+            f"input={len(prompt_token_ids[-1])}tok, "
+            f"templated_input_preview='{templated_input_preview}', "
+            f"output={len(warmup_token_ids)}tok, "
+            f"preview='{warmup_text}'"
+        )
+
+        with profile_range("bench_json:generate"):
+            if args.cuda_profiler_range:
+                torch.cuda.profiler.start()
+            try:
+                t = time.time()
+                bench_results = llm.generate(prompt_token_ids, sampling_params)
+                t = time.time() - t
+                if args.cuda_profiler_range or args.nsight_capture_range:
+                    torch.cuda.synchronize(llm.device)
+            finally:
+                if args.cuda_profiler_range:
+                    torch.cuda.profiler.stop()
 
     output_lens = []
     parse_ok = 0
