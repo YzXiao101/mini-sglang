@@ -74,18 +74,13 @@ def main() -> None:
             )
         )
 
-    capture_ctx = (
-        torch.cuda.nvtx.range(args.nsight_capture_range)
-        if args.nsight_capture_range
-        else nullcontext()
-    )
-
     def profile_range(name: str) -> ContextManager[None]:
         if args.nsight_capture_range:
             return torch.cuda.nvtx.range(name)
         return nullcontext()
 
-    with capture_ctx:
+    llm: LLM | None = None
+    try:
         with profile_range("bench_json:init_llm"):
             llm = (
                 LLM(MODEL, cuda_graph_max_bs=0)
@@ -114,18 +109,27 @@ def main() -> None:
             f"preview='{warmup_text}'"
         )
 
-        with profile_range("bench_json:generate"):
-            if args.cuda_profiler_range:
-                torch.cuda.profiler.start()
-            try:
-                t = time.time()
-                bench_results = llm.generate(prompt_token_ids, sampling_params)
-                t = time.time() - t
-                if args.cuda_profiler_range or args.nsight_capture_range:
-                    torch.cuda.synchronize(llm.device)
-            finally:
+        capture_range = (
+            torch.cuda.nvtx.range(args.nsight_capture_range)
+            if args.nsight_capture_range
+            else nullcontext()
+        )
+        with capture_range:
+            with profile_range("bench_json:generate"):
                 if args.cuda_profiler_range:
-                    torch.cuda.profiler.stop()
+                    torch.cuda.profiler.start()
+                try:
+                    t = time.time()
+                    bench_results = llm.generate(prompt_token_ids, sampling_params)
+                    t = time.time() - t
+                    if args.cuda_profiler_range or args.nsight_capture_range:
+                        torch.cuda.synchronize(llm.device)
+                finally:
+                    if args.cuda_profiler_range:
+                        torch.cuda.profiler.stop()
+    finally:
+        if llm is not None:
+            llm.shutdown()
 
     output_lens = []
     parse_ok = 0
