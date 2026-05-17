@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
 from contextlib import nullcontext
 from random import seed
@@ -156,6 +157,11 @@ def main() -> None:
     print(f"Schema valid: {schema_ok}/{schema_checked}")
     throughput = total_output_tokens / t if t > 0 else 0.0
     print(f"Total: {total_output_tokens}tok, Time: {t:.2f}s, " f"Throughput: {throughput:.2f}tok/s")
+    if args.nsight_capture_range:
+        # Avoid late CUDA graph wrapper destructors aborting before Nsight finalizes.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
