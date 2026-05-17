@@ -39,7 +39,8 @@ class ModelForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
-        torch.set_num_threads(ENV.TORCH_NUM_THREADS.value)  # reduce thread conflicts
+        if ENV.TORCH_NUM_THREADS.value > 0:
+            torch.set_num_threads(ENV.TORCH_NUM_THREADS.value)
 
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _adjust_config(config)

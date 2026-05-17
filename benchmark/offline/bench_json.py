@@ -148,6 +148,8 @@ def _run_bench(
                 "bench_requests": len(prompt_token_ids),
                 "max_output_len": args.max_output_len,
                 "overlap_enabled": not bool(ENV.DISABLE_OVERLAP_SCHEDULING),
+                "minisgl_torch_num_threads": ENV.TORCH_NUM_THREADS.value,
+                "torch_num_threads": torch.get_num_threads(),
                 "cuda_graph_max_bs": llm.engine.graph_runner.max_graph_bs,
                 "profile_scope": "step_range" if step_profile else "whole_run",
                 "profile_step_start": args.profile_step_start,
@@ -193,6 +195,11 @@ def main() -> None:
     if args.disable_cuda_graph_for_profile:
         llm_kwargs["cuda_graph_max_bs"] = 0
     llm = LLM(model, **llm_kwargs)
+    print(
+        "Thread config: "
+        f"MINISGL_TORCH_NUM_THREADS={ENV.TORCH_NUM_THREADS.value}, "
+        f"torch_num_threads={torch.get_num_threads()}"
+    )
     try:
         warmup_result = llm.generate(
             [prompt_token_ids[-1]],
