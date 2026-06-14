@@ -10,6 +10,7 @@ from minisgl.utils import alloc_delta
 
 if TYPE_CHECKING:
     from .cache import CacheManager
+    from .metric_sink import SchedulerMetricSink
     from .prefill import PrefillManager
     from .table import TableManager
 
@@ -50,9 +51,7 @@ class _EstimatePolicy:
                 tail_est = math.ceil(
                     min(req.remain_len, self.clip_max_new_tokens) * self.new_token_ratio
                 )
-            reserved_size += alloc_delta(
-                req.cached_len, req.extend_len + tail_est, self.page_size
-            )
+            reserved_size += alloc_delta(req.cached_len, req.extend_len + tail_est, self.page_size)
         return reserved_size
 
     def on_decode_success(self) -> None:
@@ -78,14 +77,33 @@ class DecodeManager:
     page_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    metric_sink: SchedulerMetricSink
     running_reqs: Set[Req] = field(default_factory=set)
     estimate_policy: "DecodeManager.EstimatePolicy" = field(init=False)
 
     def __post_init__(self) -> None:
         self.estimate_policy = self.EstimatePolicy(self.page_size)
+        self.metric_sink.emit(
+            "estimate_policy_init",
+            page_size=self.page_size,
+            init_new_token_ratio=self.estimate_policy.init_new_token_ratio,
+            min_new_token_ratio=self.estimate_policy.min_new_token_ratio,
+            new_token_ratio_decay=self.estimate_policy.new_token_ratio_decay,
+            clip_max_new_tokens=self.estimate_policy.clip_max_new_tokens,
+            retract_decode_steps=self.estimate_policy.retract_decode_steps,
+            new_token_ratio=self.estimate_policy.new_token_ratio,
+        )
 
     def reset_new_token_ratio(self) -> None:
+        ratio_before = self.estimate_policy.new_token_ratio
         self.estimate_policy.reset()
+        self.metric_sink.emit(
+            "ratio_update",
+            reason="reset",
+            ratio_before=ratio_before,
+            ratio_after=self.estimate_policy.new_token_ratio,
+            running_req_count=len(self.running_reqs),
+        )
 
     @property
     def clip_max_new_tokens(self) -> int:
@@ -108,8 +126,8 @@ class DecodeManager:
                 return req
         return None
 
-    def _check_decode_mem(self, available_size: int, steps: int = 1) -> bool:
-        need = sum(
+    def _decode_mem_need(self, steps: int = 1) -> int:
+        return sum(
             alloc_delta(
                 req.cached_len,
                 min(req.remain_len + req.extend_len, steps),
@@ -117,7 +135,33 @@ class DecodeManager:
             )
             for req in self.running_reqs
         )
-        return need <= available_size
+
+    def _emit_decode_success(
+        self,
+        *,
+        running_req_count: int,
+        available_size: int,
+        need_next: int,
+        ratio_before: float,
+    ) -> None:
+        self.metric_sink.emit_sampled(
+            "decode_schedule",
+            key="decode_success",
+            decision="success",
+            running_req_count=running_req_count,
+            available_size=available_size,
+            need_next=need_next,
+            new_token_ratio=self.estimate_policy.new_token_ratio,
+            ratio_before=ratio_before,
+        )
+        self.metric_sink.emit_sampled(
+            "ratio_update",
+            key="ratio_success",
+            reason="decode_success",
+            ratio_before=ratio_before,
+            ratio_after=self.estimate_policy.new_token_ratio,
+            running_req_count=running_req_count,
+        )
 
     def schedule_next_batch(
         self,
@@ -125,17 +169,41 @@ class DecodeManager:
     ) -> Batch | None:
         if not self.runnable:
             return None
-        if self._check_decode_mem(self.cache_manager.available_size):
+        running_req_count = len(self.running_reqs)
+        available_size = self.cache_manager.available_size
+        need_next = self._decode_mem_need()
+        if need_next <= available_size:
+            ratio_before = self.estimate_policy.new_token_ratio
             self.estimate_policy.on_decode_success()
+            if self.metric_sink.enabled:
+                self._emit_decode_success(
+                    running_req_count=running_req_count,
+                    available_size=available_size,
+                    need_next=need_next,
+                    ratio_before=ratio_before,
+                )
             return Batch(reqs=list(self.running_reqs), phase="decode")
 
         retracted_reqs = []
-        while not self._check_decode_mem(
-            self.cache_manager.available_size,
-            steps=self.estimate_policy.retract_decode_steps,
-        ):
+        need_runway_before = self._decode_mem_need(self.estimate_policy.retract_decode_steps)
+        need_runway = need_runway_before
+        while need_runway > self.cache_manager.available_size:
             if len(self.running_reqs) == 1:
                 req = next(iter(self.running_reqs))
+                self.metric_sink.emit(
+                    "decode_schedule",
+                    decision="oom",
+                    running_req_count_before=running_req_count,
+                    running_req_count_after=len(self.running_reqs),
+                    available_size_before=available_size,
+                    available_size_after=self.cache_manager.available_size,
+                    need_next=need_next,
+                    need_runway_before=need_runway_before,
+                    need_runway_after=need_runway,
+                    retract_decode_steps=self.estimate_policy.retract_decode_steps,
+                    retracted_count=len(retracted_reqs),
+                    new_token_ratio=self.estimate_policy.new_token_ratio,
+                )
                 raise RuntimeError(
                     f"Decode OOM ! retract_decode_steps={self.estimate_policy.retract_decode_steps}, "
                     f"cached_len={req.cached_len}"
@@ -149,10 +217,34 @@ class DecodeManager:
             self.table_manager.free(req.table_idx)
             self.cache_manager.cache_req(req, finished=True)
             retracted_reqs.append(req)
+            need_runway = self._decode_mem_need(self.estimate_policy.retract_decode_steps)
         prefill_manager.requeue_reqs(retracted_reqs)
 
         batch = Batch(reqs=list(self.running_reqs), phase="decode")
+        ratio_before = self.estimate_policy.new_token_ratio
         self.estimate_policy.on_retract(batch.reqs)
+        self.metric_sink.emit(
+            "ratio_update",
+            reason="retract",
+            ratio_before=ratio_before,
+            ratio_after=self.estimate_policy.new_token_ratio,
+            running_req_count=len(self.running_reqs),
+            retracted_count=len(retracted_reqs),
+        )
+        self.metric_sink.emit(
+            "decode_schedule",
+            decision="retract",
+            running_req_count_before=running_req_count,
+            running_req_count_after=len(self.running_reqs),
+            available_size_before=available_size,
+            available_size_after=self.cache_manager.available_size,
+            need_next=need_next,
+            need_runway_before=need_runway_before,
+            need_runway_after=need_runway,
+            retract_decode_steps=self.estimate_policy.retract_decode_steps,
+            retracted_count=len(retracted_reqs),
+            new_token_ratio=self.estimate_policy.new_token_ratio,
+        )
         return batch
 
     @property

@@ -19,6 +19,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
+from .metric_sink import SchedulerMetricSink
 from .prefill import ChunkedReq, PrefillManager
 from .table import TableManager
 
@@ -55,6 +56,11 @@ class Scheduler(SchedulerIOMixin):
         torch.cuda.set_stream(self.stream)
 
         # initialize other managers
+        self.metric_sink = SchedulerMetricSink(
+            ENV.SCHEDULER_METRICS_PATH.value,
+            enabled=config.tp_info.is_primary(),
+            interval=ENV.SCHEDULER_METRICS_INTERVAL.value,
+        )
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
@@ -63,9 +69,13 @@ class Scheduler(SchedulerIOMixin):
             config.page_size,
             self.cache_manager,
             self.table_manager,
+            self.metric_sink,
         )
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            self.metric_sink,
         )
 
         # some alias for easy access
@@ -139,6 +149,7 @@ class Scheduler(SchedulerIOMixin):
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
+        self.metric_sink.close()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
@@ -148,6 +159,12 @@ class Scheduler(SchedulerIOMixin):
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
+        finished_count = 0
+        eos_count = 0
+        max_len_count = 0
+        total_output_len = 0
+        total_output_budget = 0
+        total_prompt_len = 0
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if req.is_retracted:
@@ -157,13 +174,22 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
-                finished = not req.can_decode
+                max_len_finished = not req.can_decode
+                finished = max_len_finished
+                eos_finished = False
                 if not req.sampling_params.ignore_eos:
-                    finished |= next_token == self.eos_token_id
+                    eos_finished = next_token == self.eos_token_id
+                    finished |= eos_finished
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
+                    finished_count += 1
+                    eos_count += int(eos_finished)
+                    max_len_count += int(max_len_finished and not eos_finished)
+                    total_output_len += len(req.input_ids) - req.prompt_len
+                    total_output_budget += req.max_device_len - req.prompt_len
+                    total_prompt_len += req.prompt_len
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
@@ -171,6 +197,17 @@ class Scheduler(SchedulerIOMixin):
                     self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
+        if finished_count > 0 and self.metric_sink.enabled:
+            self.metric_sink.emit(
+                "request_finish_summary",
+                batch_phase=batch.phase,
+                finished_count=finished_count,
+                eos_count=eos_count,
+                max_len_count=max_len_count,
+                total_output_len=total_output_len,
+                total_output_budget=total_output_budget,
+                total_prompt_len=total_prompt_len,
+            )
         self.send_result(reply)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:

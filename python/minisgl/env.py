@@ -50,6 +50,7 @@ def _PARSE_MEM_BYTES(mem: str) -> int:
 MINISGL_ENV_PREFIX = "MINISGL_"
 EnvInt = partial(EnvVar[int], fn=int)
 EnvFloat = partial(EnvVar[float], fn=float)
+EnvStr = partial(EnvVar[str], fn=str)
 EnvBool = partial(EnvVar[bool], fn=_TO_BOOL)
 EnvOption = partial(EnvVar[bool | None], fn=_TO_BOOL, default_value=None)
 EnvMem = partial(EnvVar[int], fn=_PARSE_MEM_BYTES)
@@ -74,6 +75,8 @@ class EnvClassSingleton:
     NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     CLIP_MAX_NEW_TOKENS = EnvInt(4096)
     RETRACT_DECODE_STEPS = EnvInt(20)
+    SCHEDULER_METRICS_PATH = EnvStr("")
+    SCHEDULER_METRICS_INTERVAL = EnvInt(32)
 
     def __new__(cls):
         # single instance
